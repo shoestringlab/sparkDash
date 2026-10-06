@@ -9,6 +9,11 @@ import { SparkRegistry } from "./sparks/SparkRegistry.js";
 import { SparkMonitor } from "./sparks/SparkMonitor.js";
 import { sshExec } from "./collectors/ssh.js";
 import { comfyCancelJob } from "./collectors/comfyActions.js";
+import { LlmHostProbe } from "./collectors/LlmHostProbe.js";
+import {
+  startLlmHostAction,
+  getLlmHostAction,
+} from "./collectors/LlmHostActions.js";
 import {
   validateSparkTarget,
   createRateLimiter,
@@ -958,6 +963,139 @@ app.put("/api/sparks/:id/llm-ports/:port/api-key", (req, res) => {
   } catch (err) {
     res.status(400).json({ error: err.message });
   }
+});
+
+// ---------------------------------------------------------------------------
+// llm-host — what /opt/llm-host's llm-model@ subsystem is doing on this Spark:
+// loaded profile + engine readiness + cluster node health, the unit's
+// journal, and the per-rank crash logs a cluster launcher leaves behind.
+// Read-only on purpose: switch/start/stop stay operator actions on the box.
+// ---------------------------------------------------------------------------
+
+app.get("/api/sparks/:id/llmhost", async (req, res) => {
+  const spark = registry.getSpark(req.params.id);
+  if (!spark) return res.status(404).json({ error: "Spark not found" });
+  try {
+    res.json(await new LlmHostProbe(spark).status());
+  } catch (err) {
+    res.status(500).json({ ok: false, error: String(err.message || err) });
+  }
+});
+
+// journalctl tail for the running (or named) instance. Query: profile, lines (1–2000).
+app.get("/api/sparks/:id/llmhost/logs", async (req, res) => {
+  const spark = registry.getSpark(req.params.id);
+  if (!spark) return res.status(404).json({ error: "Spark not found" });
+  try {
+    res.json(
+      await new LlmHostProbe(spark).journal({
+        profile: req.query.profile,
+        lines: req.query.lines,
+      })
+    );
+  } catch (err) {
+    res.status(500).json({ ok: false, error: String(err.message || err) });
+  }
+});
+
+// Crash-log index per cluster node (a worker's rank logs live on the worker;
+// the probe forwards through the head). Query: profile, lines (1–500).
+app.get("/api/sparks/:id/llmhost/crash-logs", async (req, res) => {
+  const spark = registry.getSpark(req.params.id);
+  if (!spark) return res.status(404).json({ error: "Spark not found" });
+  const profile = req.query.profile;
+  if (!profile) return res.status(400).json({ error: "profile query param required" });
+  const status = await new LlmHostProbe(spark).status();
+  if (!status.ok) return res.json(status);
+  if (!status.present) return res.json({ ok: true, present: false });
+  const nodes =
+    Array.isArray(status.status?.cluster) && status.status.cluster.length
+      ? status.status.cluster.map((n) => n.node)
+      : [null];
+  const probe = new LlmHostProbe(spark);
+  const lists = await Promise.all(
+    nodes.map(async (node) => ({
+      node,
+      ...(await probe.crashLogList({
+        profile: String(profile),
+        node,
+        lines: req.query.lines,
+      })),
+    }))
+  );
+  const cliTooOld = lists.some((l) => l.cliTooOld === true);
+  res.json({ ok: true, profile, ...(cliTooOld ? { cliTooOld } : {}), nodes: lists });
+});
+
+// Tail one crash log. Query: file (required), profile, node, lines (1–5000).
+app.get("/api/sparks/:id/llmhost/crash-logs/tail", async (req, res) => {
+  const spark = registry.getSpark(req.params.id);
+  if (!spark) return res.status(404).json({ error: "Spark not found" });
+  const { file, profile, node } = req.query;
+  if (!file) return res.status(400).json({ error: "file query param required" });
+  if (!profile) return res.status(400).json({ error: "profile query param required" });
+  try {
+    res.json(
+      await new LlmHostProbe(spark).crashLogTail({
+        profile: String(profile),
+        node: node ? String(node) : undefined,
+        file: String(file),
+        lines: req.query.lines,
+      })
+    );
+  } catch (err) {
+    res.status(500).json({ ok: false, error: String(err.message || err) });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// llm-host process management (Tier 2). One background action per Spark,
+// polled at /llmhost/action — a switch is minutes, never a request/response.
+// ---------------------------------------------------------------------------
+
+/** `llm-model list --json` for the switch/start pickers. */
+app.get("/api/sparks/:id/llmhost/profiles", async (req, res) => {
+  const spark = registry.getSpark(req.params.id);
+  if (!spark) return res.status(404).json({ error: "Spark not found" });
+  try {
+    const out = await new LlmHostProbe(spark)._run(["list", "--json"], 25000);
+    const trimmed = String(out).trim();
+    if (trimmed === "__LLMHOST_MISSING__") {
+      return res.json({ ok: true, present: false });
+    }
+    res.json({ ok: true, profiles: JSON.parse(trimmed) });
+  } catch (err) {
+    res.json({ ok: false, error: String(err.message || err) });
+  }
+});
+
+/** Start switch/start/stop. Body: { action, profile? }. 202 with the job. */
+app.post("/api/sparks/:id/llmhost/action", (req, res) => {
+  const spark = registry.getSpark(req.params.id);
+  if (!spark) return res.status(404).json({ error: "Spark not found" });
+  if (spark.workerNode) {
+    return res.status(400).json({ error: "Worker nodes do not run the llm-model unit" });
+  }
+  try {
+    const { job } = startLlmHostAction(spark, {
+      action: req.body?.action,
+      profile: req.body?.profile,
+    });
+    res.status(202).json({ ok: true, job });
+  } catch (err) {
+    if (err.statusCode === 409) return res.status(409).json({ ok: false, error: err.message });
+    if (/Invalid llm-host|Unknown action/.test(err.message)) {
+      return res.status(400).json({ ok: false, error: err.message });
+    }
+    res.status(500).json({ ok: false, error: String(err.message || err) });
+  }
+});
+
+/** Poll the current/last action for this Spark. */
+app.get("/api/sparks/:id/llmhost/action", (req, res) => {
+  const spark = registry.getSpark(req.params.id);
+  if (!spark) return res.status(404).json({ error: "Spark not found" });
+  res.json({ ok: true, job: getLlmHostAction(spark.id) });
 });
 
 /**

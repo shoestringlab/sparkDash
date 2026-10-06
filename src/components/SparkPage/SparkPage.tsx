@@ -12,6 +12,7 @@ import { NetworkPanel } from "./NetworkPanel";
 import { TailscalePanel } from "./TailscalePanel";
 import { LlmPanel } from "./LlmPanel";
 import { ComfyPanel } from "./ComfyPanel";
+import { LlmHostPanel } from "./LlmHostPanel";
 import { ChevronDownIcon } from "../ui/icons";
 import { vramContextFor } from "../../shared/vramBreakdown";
 
@@ -384,6 +385,7 @@ export function SparkPage({
                   + Add LLM port
                 </button>
               ))}
+            {llmOn && <LlmHostPanel sparkId={spark.id} className="md:col-span-2" />}
           </>
         )}
       </div>
